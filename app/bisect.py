@@ -7,6 +7,27 @@ commit is a known pass, the last is a known reproduction of the failure, and
 the fault is assumed to persist once introduced (monotonic failure).
 
 Executors *claim* commits to test.  Every commit is dispatched at most once.
+A claim may carry an optional ``request_id`` chosen by the executor.  The pair
+``(executor, request_id)`` is an idempotency key that solves the lost-response
+problem: if the claim response never arrives, retrying with the same number
+returns the original dispatch instead of handing out a different commit.
+
+Idempotent claim semantics (``request_id`` given):
+
+* First call with a key dispatches a commit (or returns the current
+  no-dispatch reason, in which case nothing is remembered and a later retry
+  re-evaluates the current dispatch state).
+* Same key, same executor, while the original commit is still outstanding --
+  even concurrently -- returns that same commit exactly once worth of
+  dispatch: it stays in the in-flight list a single time.  This also holds
+  when the commit has meanwhile fallen outside the suspect range or the
+  session has stopped dispatching (contradiction / completion).
+* Same key after the original commit has been reported returns an
+  ``already_reported`` answer naming the reported commit, without touching
+  the in-flight list.
+* A new ``request_id`` is a fresh claim.  Calls without ``request_id`` keep
+  the legacy behaviour: every call is a new claim.
+
 Reports come back as ``pass`` / ``fail`` / ``build_failure``:
 
 * ``pass``  -> commit is good; the lower bound of the suspect range moves up.
@@ -98,49 +119,128 @@ class BisectSession:
         self.status = SessionStatus.RUNNING
         self.in_flight: dict[int, dict] = {}   # idx -> claim info
         self.reports: dict[int, dict] = {}     # idx -> report info
+        # Idempotency ledger for claims that carried a request_id.
+        # key = (executor, request_id) -> {"idx": dispatched index}
+        # Only successful dispatches are remembered; no-claim answers are not,
+        # so a retry after a no-claim reflects the current dispatch state.
+        self.claim_keys: dict[tuple[str, str], dict] = {}
         self.contradiction: dict | None = None
         self.lock = threading.Lock()
         self._check_completion_locked()
 
     # ------------------------------------------------------------------ claim
 
-    def claim(self, executor: str) -> dict:
-        """Hand out one commit to test, or explain why none is available."""
+    def claim(self, executor: str, request_id: str | None = None) -> dict:
+        """Hand out one commit to test, or explain why none is available.
+
+        With ``request_id`` the call is idempotent per ``(executor,
+        request_id)``: a retried request number recovers the original dispatch
+        instead of claiming a second commit (module docstring has the full
+        rules).  Concurrent calls sharing a key are serialised by the session
+        lock and therefore dispatch at most one commit.
+        """
         with self.lock:
-            if self.status is SessionStatus.CONTRADICTION:
-                return self._no_claim("contradiction",
-                                      "dispatch halted: contradictory results recorded")
-            if self.status is SessionStatus.COMPLETED:
-                return self._no_claim("completed", "bisection already finished")
-            candidates = [
-                i for i in range(self.good_idx + 1, self.bad_idx)
-                if self.states[i] is CommitState.PENDING
-            ]
-            if not candidates:
-                if self.in_flight:
-                    return self._no_claim(
-                        "waiting_for_reports",
-                        "no untested commit in the suspect range; "
-                        "waiting for claimed tests to report back",
-                    )
-                # Defensive: _check_completion_locked should have caught this.
-                return self._no_claim("no_testable_commits",
-                                      "nothing left that can narrow the range")
-            mid = (self.good_idx + self.bad_idx) / 2
-            idx = min(candidates, key=lambda i: (abs(i - mid), i))
-            self.states[idx] = CommitState.CLAIMED
-            self.in_flight[idx] = {"executor": executor, "claimed_at": _utcnow()}
+            if request_id is not None:
+                key = (executor, request_id)
+                record = self.claim_keys.get(key)
+                if record is not None:
+                    return self._replay_claim_locked(key, record, request_id)
+            else:
+                key = None
+
+            answer = self._dispatch_claim_locked(executor, request_id)
+            # Remember only real dispatches; a no-claim answer is re-evaluated
+            # from scratch on every same-number retry.
+            if key is not None and answer["commit"] is not None:
+                self.claim_keys[key] = {"idx": answer["index"]}
+            return answer
+
+    def _replay_claim_locked(
+        self, key: tuple[str, str], record: dict, request_id: str
+    ) -> dict:
+        """Answer a repeated (executor, request_id) claim from the ledger."""
+        idx = record["idx"]
+        executor = key[0]
+        commit = self.commits[idx]
+        if self.states[idx] is CommitState.CLAIMED:
+            # Original dispatch is still outstanding -- possibly outside the
+            # suspect range or while dispatch is halted.  Hand it back; the
+            # in-flight entry is unchanged, so it is still dispatched once.
             return {
-                "commit": self.commits[idx],
+                "commit": commit,
                 "index": idx,
                 "executor": executor,
                 "reason": None,
                 "detail": None,
+                "request_id": request_id,
+                "replayed": True,
             }
+        # The original commit has a report.  Say which commit was reported and
+        # leave the in-flight list untouched.
+        report = self.reports.get(idx) or {}
+        result = report.get("result", self.states[idx].value)
+        return {
+            "commit": commit,
+            "index": idx,
+            "executor": executor,
+            "reason": "already_reported",
+            "detail": (
+                f"request_id {request_id!r} originally dispatched commit "
+                f"{commit!r}, which already has a result ({result}); "
+                "the in-flight list is unchanged"
+            ),
+            "request_id": request_id,
+            "replayed": True,
+        }
 
-    def _no_claim(self, reason: str, detail: str) -> dict:
+    def _dispatch_claim_locked(self, executor: str, request_id: str | None) -> dict:
+        """The pre-idempotency dispatch logic, annotated with request_id."""
+        if self.status is SessionStatus.CONTRADICTION:
+            return self._no_claim("contradiction",
+                                  "dispatch halted: contradictory results recorded",
+                                  request_id)
+        if self.status is SessionStatus.COMPLETED:
+            return self._no_claim("completed", "bisection already finished",
+                                  request_id)
+        candidates = [
+            i for i in range(self.good_idx + 1, self.bad_idx)
+            if self.states[i] is CommitState.PENDING
+        ]
+        if not candidates:
+            if self.in_flight:
+                return self._no_claim(
+                    "waiting_for_reports",
+                    "no untested commit in the suspect range; "
+                    "waiting for claimed tests to report back",
+                    request_id,
+                )
+            # Defensive: _check_completion_locked should have caught this.
+            return self._no_claim("no_testable_commits",
+                                  "nothing left that can narrow the range",
+                                  request_id)
+        mid = (self.good_idx + self.bad_idx) / 2
+        idx = min(candidates, key=lambda i: (abs(i - mid), i))
+        self.states[idx] = CommitState.CLAIMED
+        self.in_flight[idx] = {
+            "executor": executor,
+            "claimed_at": _utcnow(),
+            "request_id": request_id,
+        }
+        return {
+            "commit": self.commits[idx],
+            "index": idx,
+            "executor": executor,
+            "reason": None,
+            "detail": None,
+            "request_id": request_id,
+            "replayed": False,
+        }
+
+    def _no_claim(self, reason: str, detail: str,
+                  request_id: str | None = None) -> dict:
         return {"commit": None, "index": None, "executor": None,
-                "reason": reason, "detail": detail}
+                "reason": reason, "detail": detail,
+                "request_id": request_id, "replayed": False}
 
     # ----------------------------------------------------------------- report
 
@@ -255,6 +355,7 @@ class BisectSession:
                         "index": i,
                         "commit": self.commits[i],
                         "executor": info["executor"],
+                        "request_id": info.get("request_id"),
                         "claimed_at": info["claimed_at"],
                     }
                     for i, info in sorted(self.in_flight.items())

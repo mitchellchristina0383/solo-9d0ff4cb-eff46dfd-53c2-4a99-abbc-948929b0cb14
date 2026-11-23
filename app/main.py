@@ -4,7 +4,10 @@ Workflow (all endpoints also explorable via the Swagger UI at /docs):
 
 1. ``POST /sessions``            -- test lead registers the ordered commit list
 2. ``POST /sessions/{id}/claims``  -- executors claim commits (parallel safe,
-                                      each commit dispatched at most once)
+                                      each commit dispatched at most once).
+                                      An optional ``request_id`` makes a claim
+                                      retriable: the same number recovers the
+                                      original dispatch after a lost response.
 3. ``POST /sessions/{id}/reports`` -- executors report pass / fail /
                                       build_failure
 4. ``GET  /sessions/{id}``         -- live status: suspect range, in-flight
@@ -31,7 +34,7 @@ from .bisect import (
 
 app = FastAPI(
     title="CI Bisect Service",
-    version="1.0.0",
+    version="1.1.0",
     summary="Parallel commit bisection to find the change that broke a CI test.",
 )
 
@@ -69,6 +72,17 @@ class ClaimIn(BaseModel):
     executor: str = Field(min_length=1, max_length=64,
                           description="Identifier of the claiming executor.",
                           examples=["executor-1"])
+    request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Optional executor-chosen request number. The pair "
+                    "(executor, request_id) is idempotent: retrying a claim "
+                    "whose response was lost with the same number returns the "
+                    "original dispatch instead of a different commit. Omit it "
+                    "for legacy one-claim-per-call behaviour.",
+        examples=["req-0007"],
+    )
 
 
 class ClaimView(BaseModel):
@@ -76,9 +90,19 @@ class ClaimView(BaseModel):
     commit: str | None = Field(description="Commit to test; null when nothing can be dispatched.")
     index: int | None
     executor: str | None
+    request_id: str | None = Field(
+        description="Echoes the request number from the request (null for "
+                    "legacy claims and no-dispatch answers)."
+    )
+    replayed: bool = Field(
+        description="True when this answer is a replay for a request_id seen "
+                    "before, so no new commit was dispatched."
+    )
     reason: str | None = Field(
-        description="Why no commit was handed out: completed | contradiction | "
-                    "waiting_for_reports | no_testable_commits")
+        description="Why no commit was handed out, or why a replay has nothing "
+                    "new: completed | contradiction | waiting_for_reports | "
+                    "no_testable_commits | already_reported"
+    )
     detail: str | None
 
 
@@ -99,6 +123,7 @@ class InFlightView(BaseModel):
     index: int
     commit: str
     executor: str
+    request_id: str | None
     claimed_at: str
 
 
@@ -210,9 +235,18 @@ def get_session(session_id: str) -> SessionView:
 def claim(session_id: str, body: ClaimIn) -> ClaimView:
     """Claim the next commit to test.  Parallel-safe: each commit is
     dispatched at most once.  ``commit`` is null when nothing can be
-    dispatched right now (see ``reason``)."""
+    dispatched right now (see ``reason``).
+
+    Include an optional ``request_id`` to make the call idempotent: if the
+    response to the first claim was lost, repeat the same number and get the
+    original commit back (``replayed=true``) instead of claiming another one.
+    If that commit was already reported, the answer uses reason
+    ``already_reported`` and names it; the in-flight list is unchanged."""
     session = _get_session(session_id)
-    return ClaimView(session_id=session_id, **session.claim(body.executor))
+    return ClaimView(
+        session_id=session_id,
+        **session.claim(body.executor, request_id=body.request_id),
+    )
 
 
 @app.post("/sessions/{session_id}/reports", response_model=SessionView, tags=["bisect"])
