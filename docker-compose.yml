@@ -1,0 +1,14 @@
+services:
+  bisect:
+    build: .
+    ports:
+      - "8000:8000"
+    # Swagger UI: http://localhost:8000/docs
+    restart: unless-stopped
+
+  tests:
+    build: .
+    profiles: ["test"]
+    volumes:
+      - .:/srv
+    command: sh -c "pip install -q -r requirements-dev.txt && python -m pytest tests -q"
